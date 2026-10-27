@@ -1,15 +1,5 @@
-# ──────────────────────────────────────────────────────────────────────────────
-#  CircleCI · juice-shop · BUILD ONLY
-#
-#  Goal right now: prove the app installs through Nexus and compiles.
-#  Firewall and Lifecycle are commented out at the bottom - restore them
-#  once this job is green.
-#
-#  Run it:  circleci local execute --job build
-# ──────────────────────────────────────────────────────────────────────────────
-
 version: 2.1
-##
+
 jobs:
 
   build:
@@ -22,7 +12,8 @@ jobs:
       - run:
           name: "STAGE 1 - Point npm at the Nexus proxy"
           command: |
-            npm config set registry http://host.docker.internal:8081/repository/jenkins-npm-proxy/
+            REG="${NEXUS_REGISTRY:-http://host.docker.internal:8081/repository/jenkins-npm-proxy/}"
+            npm config set registry "$REG"
             echo "Node $(node -v)"
             echo "Registry: $(npm config get registry)"
 
@@ -47,15 +38,3 @@ workflows:
   build_only:
     jobs:
       - build
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  NEXT: once the build job is green, bring back the other two layers from the
-#  full config - add the firewall_gate and lifecycle_scan jobs, then:
-#
-#  workflows:
-#    sonatype_demo:
-#      jobs:
-#        - build
-#        - firewall_gate
-#        - lifecycle_scan
-# ──────────────────────────────────────────────────────────────────────────────
