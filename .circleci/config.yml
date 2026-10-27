@@ -1,7 +1,30 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  CircleCI · Sonatype end-to-end demo · juice-shop
+#
+#  Mirrors the Jenkins pipeline:
+#     build           Source -> Proxy -> Compile
+#     firewall_gate   Repository Firewall stops a bad package at the door
+#     lifecycle_scan  Lifecycle policy evaluation (optional)
+#
+#  RUN LOCALLY (one job at a time):
+#    circleci local execute --job build          -e NEXUS_REGISTRY=$REG
+#    circleci local execute --job firewall_gate  -e NEXUS_REGISTRY=$REG
+#
+#  where, with the socat bridge running on the Mac:
+#    REG=http://192.168.1.67:18081/repository/jenkins-npm-proxy/
+#
+#  Nexus is bound to 127.0.0.1 only, so containers reach it through socat:
+#    socat TCP-LISTEN:18081,fork,reuseaddr TCP:127.0.0.1:8081 &
+#
+#  No pipeline parameters and no reusable commands/executors on purpose -
+#  local execute runs this file as-is, with no config processing step.
+# ──────────────────────────────────────────────────────────────────────────────
+
 version: 2.1
 
 jobs:
 
+  # ── STAGE 1-3 · SOURCE · PROXY · BUILD ─────────────────────────────────────
   build:
     docker:
       - image: cimg/node:22.11
@@ -10,10 +33,11 @@ jobs:
       - checkout
 
       - run:
-          name: "STAGE 1 - Point npm at the Nexus proxy"
+          name: "STAGE 1 - Source checked out, npm pointed at Nexus"
           command: |
             REG="${NEXUS_REGISTRY:-http://host.docker.internal:8081/repository/jenkins-npm-proxy/}"
             npm config set registry "$REG"
+            printf '\033[1;38;5;33m\n━━━  STAGE 1 · SOURCE · Code checked out  ━━━\033[0m\n\n'
             echo "Node $(node -v)"
             echo "Registry: $(npm config get registry)"
 
@@ -21,20 +45,140 @@ jobs:
           name: "STAGE 2 - Dependencies via Nexus Repository"
           command: |
             set -o pipefail
+            printf '\033[1;38;5;33m\n━━━  STAGE 2 · PROXY · Dependencies resolved through Nexus  ━━━\033[0m\n\n'
             npm install --ignore-scripts --package-lock=true --no-audit --no-fund \
               --loglevel http 2>&1 | tee /tmp/npm-proxy.log
             N=$(grep -c "http fetch GET 200" /tmp/npm-proxy.log || true)
-            echo ""
-            echo "$N packages resolved through Nexus Repository"
+            printf '\033[1;38;5;34m\n✔  %s packages resolved through Nexus Repository, each one inspected on the way in\033[0m\n' "$N"
 
       - run:
           name: "STAGE 3 - Compile"
           command: |
+            printf '\033[1;38;5;33m\n━━━  STAGE 3 · BUILD · Compile  ━━━\033[0m\n\n'
             npm run build:server
             ls -la build/app.js
-            echo "Build succeeded: build/app.js ready"
+            printf '\033[1;38;5;34m✔  Build succeeded: build/app.js ready\033[0m\n'
+
+  # ── STAGE 2b · FIREWALL AT THE DOOR ────────────────────────────────────────
+  firewall_gate:
+    docker:
+      - image: cimg/node:22.11
+    working_directory: ~/project
+    steps:
+      - checkout
+
+      - run:
+          name: "STAGE 2b - Sonatype Repository Firewall at the door"
+          command: |
+            set +e
+            REG="${NEXUS_REGISTRY:-http://host.docker.internal:8081/repository/jenkins-npm-proxy/}"
+            npm config set registry "$REG"
+
+            E=$(printf '\033')
+            B="${E}[1;38;5;33m"; D2="${E}[38;5;25m"; S="${E}[38;5;75m"; W="${E}[1;97m"
+            GR="${E}[1;38;5;34m"; AM="${E}[38;5;214m"; R="${E}[1;38;5;160m"
+            D="${E}[2m"; BO="${E}[1m"; X="${E}[0m"
+
+            printf "${B}\n━━━  STAGE 2b · PROXY · Sonatype Repository Firewall at the door  ━━━${X}\n\n"
+            echo "Registry: $(npm config get registry)"
+
+            BLOCKED=0
+            for V in 2.0.0 2.1.0; do
+              rm -rf /tmp/fw-demo && mkdir -p /tmp/fw-demo && cd /tmp/fw-demo
+              echo '{"name":"fw-demo","version":"1.0.0","private":true}' > package.json
+              echo ""
+              echo "${BO}▶ A developer adds @sonatype/policy-demo@$V${X}  ${D}(official Sonatype test package)${X}"
+              npm install @sonatype/policy-demo@$V --no-save --no-package-lock \
+                --no-audit --no-fund --ignore-scripts > /tmp/fw.log 2>&1
+
+              if grep -qi "quarantin" /tmp/fw.log; then
+                BLOCKED=1
+                sed "s/^/${D}/; s/$/${X}/" /tmp/fw.log
+                LINK=$(grep -o "http[^ ]*links/firewall[^ <]*" /tmp/fw.log | head -1 \
+                       | sed 's#host.docker.internal#localhost#')
+                MSG=$(grep -o 'Blocked by [^>]*' /tmp/fw.log | head -1 | sed 's/ *-\{3,\}.*$//')
+
+                echo ""
+                echo "${B}╔══════════════════════════════════════════════════════════════════════════════╗${X}"
+                echo "${B}║                                                                              ║${X}"
+                echo "${B}║${X}${W}       ◆   S Y S C O   ·   A P P L I C A T I O N   S E C U R I T Y   ◆        ${X}${B}║${X}"
+                echo "${B}║${X}${R}                      COMPONENT QUARANTINED BY FIREWALL                       ${X}${B}║${X}"
+                echo "${B}║                                                                              ║${X}"
+                echo "${B}╚══════════════════════════════════════════════════════════════════════════════╝${X}"
+                echo ""
+                echo "  ${B}━━━  STOPPED AT THE PROXY  ━━━${X}   ${D}1 component blocked before entry${X}"
+                echo ""
+                echo "      ${R}✖  @sonatype/policy-demo@$V${X}"
+                echo "         ${AM}Sonatype Release Integrity · rating Suspicious · malicious code category${X}"
+                [ -n "$LINK" ] && echo "         ${S}→  ${LINK}${X}"
+                echo ""
+                [ -n "$MSG" ] && echo "  ${AM}${MSG}${X}" && echo ""
+                echo "${D2}  ─────────────────────────────────────────────────────────────────────────────${X}"
+                echo ""
+                echo "  ${GR}◆  PATH A  —  Move to a clean version${X}   ${D}(fastest, usually a point release)${X}"
+                echo ""
+                echo "         ${GR}✔  @sonatype/policy-demo@2.0.0${X}   ${D}(Integrity Rating: Normal)${X}"
+                echo ""
+                echo "${D2}  ─────────────────────────────────────────────────────────────────────────────${X}"
+                echo ""
+                echo "  ${B}◆  PATH B  —  Talk to the Sysco AppSec team${X}"
+                echo ""
+                echo "      ${W}Need this component to ship? Any one of these folks can help —${X}"
+                echo "      ${W}we will review the risk with you and find a safe way forward.${X}"
+                echo ""
+                echo "          ${B}▸  Mohammed Yoosuf  ${X}${S}mohammed.yoosuf@sysco.com${X}"
+                echo "          ${B}▸  Randy Bergeron   ${X}${S}randy.bergeron@sysco.com${X}"
+                echo "          ${B}▸  Sudheera Lakmal  ${X}${S}sudheera.lakmal@sysco.com${X}"
+                echo "          ${B}▸  Asanka Vithanage ${X}${S}asanka.vithanage@sysco.com${X}"
+                echo "          ${B}▸  Canyon Sembera   ${X}${S}canyon.sembera@sysco.com${X}"
+                echo ""
+                echo "${B}════════════════════════════════════════════════════════════════════════════════${X}"
+                echo "  ${BO}Company${X} Sysco Corporation · Houston, TX   ·   ${BO}Policy${X} Sysco-Prod-Strict   ·   ${BO}SLA${X} 4 business hours"
+                echo "${B}════════════════════════════════════════════════════════════════════════════════${X}"
+                echo "${GR}      ◆${X}${W}   Sysco  ·  Every supply chain deserves an inspection point   ${X}${GR}◆${X}"
+                echo "${B}════════════════════════════════════════════════════════════════════════════════${X}"
+              else
+                cat /tmp/fw.log
+                echo "  ${GR}✔  @sonatype/policy-demo@$V allowed by Firewall (Integrity Rating: Normal)${X}"
+              fi
+            done
+
+            if [ "$BLOCKED" = "1" ]; then
+              echo ""
+              echo "${AM}Firewall stopped a component at the door. The build continues so the team can decide.${X}"
+            fi
+            exit 0
+
+  # ── STAGE 2c · LIFECYCLE (optional) ────────────────────────────────────────
+  #  Enable by passing, with the socat bridge for IQ on 18070:
+  #    -e IQ_URL=http://192.168.1.67:18070
+  #    -e IQ_AUTH=<token-code>:<token-passcode>
+  #    -e IQ_CLI_URL=<url to the Sonatype IQ CLI jar>
+  #  Bridge:  socat TCP-LISTEN:18070,fork,reuseaddr TCP:127.0.0.1:8070 &
+  lifecycle_scan:
+    docker:
+      - image: cimg/openjdk:17.0-node
+    working_directory: ~/project
+    steps:
+      - checkout
+
+      - run:
+          name: "STAGE 2c - Lifecycle evaluates the declared dependencies"
+          command: |
+            printf '\033[1;38;5;33m\n━━━  STAGE 2c · BUILD · Lifecycle policy evaluation  ━━━\033[0m\n\n'
+            if [ -z "$IQ_URL" ] || [ -z "$IQ_AUTH" ] || [ -z "$IQ_CLI_URL" ]; then
+              echo "Lifecycle not configured - set IQ_URL, IQ_AUTH and IQ_CLI_URL to enable."
+              exit 0
+            fi
+            curl -sSL "$IQ_CLI_URL" -o /tmp/nexus-iq-cli.jar
+            java -jar /tmp/nexus-iq-cli.jar \
+              -i "juice-shop-wearedevelopers__sonatype-vince" \
+              -s "$IQ_URL" -a "$IQ_AUTH" -t build \
+              package-lock.json
 
 workflows:
-  build_only:
+  sonatype_demo:
     jobs:
       - build
+      - firewall_gate
+      - lifecycle_scan
